@@ -48,6 +48,7 @@ logs/
 runs/
 wandb/
 tensorboard/
+*.log
 
 # Hugging Face
 .cache/

@@ -3,16 +3,19 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import os
+import sys
 import argparse
 from dataset import VLADataset, collate_fn
 from model import SimpleVLA
 import json
 from datetime import datetime
+import logging
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, device, epoch):
+def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, writer=None, global_step=0):
     """Train for one epoch"""
     model.train()
     total_loss = 0.0
@@ -21,6 +24,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch):
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
     for batch_idx, batch in enumerate(progress_bar):
+        # Clear cache before each batch to prevent OOM
+        if batch_idx % 10 == 0:
+            torch.cuda.empty_cache()
+        
         # Move to device
         ego_images = batch['ego_images'].to(device)
         top_images = batch['top_images'].to(device)
@@ -30,35 +37,52 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch):
         # Forward pass
         optimizer.zero_grad()
         
-        noise_pred, noise, timesteps = model(
-            ego_images=ego_images,
-            top_images=top_images,
-            instructions=instructions,
-            robot_positions=robot_positions
-        )
-        
-        # Compute loss (MSE between predicted and actual noise)
-        loss = nn.functional.mse_loss(noise_pred, noise)
-        
-        # Backward pass
-        loss.backward()
-        
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
-        scheduler.step()
-        
-        total_loss += loss.item()
-        num_batches += 1
-        
-        # Update progress bar
-        progress_bar.set_postfix({'loss': loss.item(), 'avg_loss': total_loss / num_batches})
+        try:
+            noise_pred, noise, timesteps = model(
+                ego_images=ego_images,
+                top_images=top_images,
+                instructions=instructions,
+                robot_positions=robot_positions
+            )
+            
+            # Compute loss (MSE between predicted and actual noise)
+            loss = nn.functional.mse_loss(noise_pred, noise)
+            
+            # Backward pass
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            scheduler.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+            current_step = global_step + batch_idx
+            
+            # Log to tensorboard
+            if writer is not None:
+                writer.add_scalar('Train/Loss', loss.item(), current_step)
+                # Get learning rate from optimizer
+                current_lr = optimizer.param_groups[0]['lr']
+                writer.add_scalar('Train/LearningRate', current_lr, current_step)
+            
+            # Update progress bar
+            progress_bar.set_postfix({'loss': loss.item(), 'avg_loss': total_loss / num_batches})
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"\nOOM at batch {batch_idx}, clearing cache and skipping batch")
+                torch.cuda.empty_cache()
+                continue
+            else:
+                raise
     
-    return total_loss / num_batches if num_batches > 0 else 0.0
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    return avg_loss, global_step + len(dataloader)
 
 
-def validate(model, dataloader, device):
+def validate(model, dataloader, device, epoch, writer=None):
     """Validate the model"""
     model.eval()
     total_loss = 0.0
@@ -84,7 +108,13 @@ def validate(model, dataloader, device):
             total_loss += loss.item()
             num_batches += 1
     
-    return total_loss / num_batches if num_batches > 0 else 0.0
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    
+    # Log to tensorboard
+    if writer is not None:
+        writer.add_scalar('Val/Loss', avg_loss, epoch)
+    
+    return avg_loss
 
 
 def main():
@@ -116,24 +146,53 @@ def main():
                         help='Path to checkpoint to resume from')
     parser.add_argument('--val_split', type=float, default=0.2,
                         help='Validation split ratio')
+    parser.add_argument('--save_interval', type=int, default=1,
+                        help='Save checkpoint every N epochs (default: 1)')
+    parser.add_argument('--log_dir', type=str, default=None,
+                        help='Directory for tensorboard logs (default: output_dir/runs)')
     
     args = parser.parse_args()
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Setup logging to file
+    log_file = os.path.join(args.output_dir, f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    logger = logging.getLogger(__name__)
+    logger.info(f"Training log will be saved to: {log_file}")
+    
+    # Setup TensorBoard
+    if args.log_dir is None:
+        log_dir = os.path.join(args.output_dir, 'runs')
+    else:
+        log_dir = args.log_dir
+    os.makedirs(log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=log_dir)
+    logger.info(f"TensorBoard logs will be saved to: {log_dir}")
+    logger.info(f"To view TensorBoard, run: tensorboard --logdir {log_dir}")
+    
     # Save config
     config = vars(args)
     config['timestamp'] = datetime.now().isoformat()
+    config['log_file'] = log_file
+    config['tensorboard_log_dir'] = log_dir
     with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=2)
     
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
     
     # Create dataset
-    print("Loading dataset...")
+    logger.info("Loading dataset...")
     full_dataset = VLADataset(
         data_root=args.data_root,
         history_length=args.history_length,
@@ -148,7 +207,7 @@ def main():
         full_dataset, [train_size, val_size]
     )
     
-    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
     
     # Create dataloaders
     train_loader = DataLoader(
@@ -170,7 +229,7 @@ def main():
     )
     
     # Create model
-    print("Creating model...")
+    logger.info("Creating model...")
     model = SimpleVLA(
         use_lora=args.use_lora,
         lora_r=args.lora_r,
@@ -182,12 +241,14 @@ def main():
     
     # Resume from checkpoint if specified
     start_epoch = 0
+    global_step = 0
     if args.resume:
-        print(f"Loading checkpoint from {args.resume}")
+        logger.info(f"Loading checkpoint from {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
-        print(f"Resuming from epoch {start_epoch}")
+        global_step = checkpoint.get('global_step', start_epoch * len(train_loader))
+        logger.info(f"Resuming from epoch {start_epoch}, global_step {global_step}")
     
     # Optimizer and scheduler
     optimizer = AdamW(
@@ -206,21 +267,24 @@ def main():
     best_val_loss = float('inf')
     
     for epoch in range(start_epoch, args.epochs):
-        print(f"\n{'='*50}")
-        print(f"Epoch {epoch + 1}/{args.epochs}")
-        print(f"{'='*50}")
+        logger.info(f"\n{'='*50}")
+        logger.info(f"Epoch {epoch + 1}/{args.epochs}")
+        logger.info(f"{'='*50}")
         
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, scheduler, device, epoch)
+        train_loss, global_step = train_epoch(
+            model, train_loader, optimizer, scheduler, device, epoch, writer, global_step
+        )
         
         # Validate
-        val_loss = validate(model, val_loader, device)
+        val_loss = validate(model, val_loader, device, epoch, writer)
         
-        print(f"\nTrain Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        logger.info(f"\nTrain Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         
         # Save checkpoint
         checkpoint = {
             'epoch': epoch,
+            'global_step': global_step,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
@@ -235,14 +299,21 @@ def main():
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(checkpoint, os.path.join(args.output_dir, 'best.pth'))
-            print(f"Saved best model (val_loss: {val_loss:.4f})")
+            logger.info(f"Saved best model (val_loss: {val_loss:.4f})")
         
-        # Save periodic checkpoints
-        if (epoch + 1) % 5 == 0:
-            torch.save(checkpoint, os.path.join(args.output_dir, f'checkpoint_epoch_{epoch+1}.pth'))
+        # Save checkpoints at specified interval
+        if (epoch + 1) % args.save_interval == 0:
+            checkpoint_path = os.path.join(args.output_dir, f'checkpoint_epoch_{epoch+1}.pth')
+            torch.save(checkpoint, checkpoint_path)
+            logger.info(f"Saved checkpoint: {checkpoint_path}")
     
-    print("\nTraining completed!")
-    print(f"Best validation loss: {best_val_loss:.4f}")
+    # Close tensorboard writer
+    writer.close()
+    
+    logger.info("\nTraining completed!")
+    logger.info(f"Best validation loss: {best_val_loss:.4f}")
+    logger.info(f"Training log saved to: {log_file}")
+    logger.info(f"TensorBoard logs saved to: {log_dir}")
 
 
 if __name__ == '__main__':

@@ -29,6 +29,7 @@ class DiffusionActionHead(nn.Module):
         self.num_timesteps = num_timesteps
         
         # Create UNet for diffusion
+        # Use hidden_dim for cross_attention_dim since we'll project features to hidden_dim
         self.unet = UNet2DConditionModel(
             sample_size=trajectory_length,
             in_channels=action_dim,
@@ -44,7 +45,7 @@ class DiffusionActionHead(nn.Module):
                 "UpBlock2D",
             ),
             block_out_channels=(128, 256, 512),
-            cross_attention_dim=input_dim,
+            cross_attention_dim=hidden_dim,  # Match the projected dimension
             attention_head_dim=8,
         )
         
@@ -56,6 +57,7 @@ class DiffusionActionHead(nn.Module):
         )
         
         # Projection layer to match UNet input
+        # Use float32 for UNet (diffusers UNet works better with float32)
         self.input_proj = nn.Linear(input_dim, hidden_dim)
     
     def forward(
@@ -75,12 +77,17 @@ class DiffusionActionHead(nn.Module):
         """
         batch_size = features.shape[0]
         
+        # Convert features to float32 for UNet (UNet works better with float32)
+        features = features.to(torch.float32)
+        
         # Project features
         hidden = self.input_proj(features)  # [B, hidden_dim]
         
         # Expand for UNet conditioning
-        hidden = hidden.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, hidden_dim]
-        hidden = hidden.expand(-1, self.trajectory_length, -1, -1)  # [B, T, 1, hidden_dim]
+        # UNet expects encoder_hidden_states as [B, seq_len, hidden_dim]
+        # We need to expand to match the trajectory length
+        hidden = hidden.unsqueeze(1)  # [B, 1, hidden_dim]
+        hidden = hidden.expand(-1, self.trajectory_length, -1)  # [B, T, hidden_dim]
         
         if self.training and actions is not None:
             # Training: apply diffusion process
@@ -232,6 +239,13 @@ class SimpleVLA(nn.Module):
             )
             self.paligemma = get_peft_model(self.paligemma, lora_config)
             self.paligemma.print_trainable_parameters()
+            
+            # Enable gradient checkpointing to save memory
+            if hasattr(self.paligemma, 'gradient_checkpointing_enable'):
+                self.paligemma.gradient_checkpointing_enable()
+            elif hasattr(self.paligemma.base_model, 'gradient_checkpointing_enable'):
+                self.paligemma.base_model.gradient_checkpointing_enable()
+            print("Gradient checkpointing enabled to save memory")
         
         # Get feature dimension from PaliGemma
         # PaliGemma uses Gemma language model with vision encoder
@@ -239,7 +253,8 @@ class SimpleVLA(nn.Module):
         hidden_size = self.paligemma.config.text_config.hidden_size
         
         # Feature projection to combine vision and language
-        self.feature_proj = nn.Linear(hidden_size, hidden_size)
+        # Use bfloat16 to match PaliGemma model dtype
+        self.feature_proj = nn.Linear(hidden_size, hidden_size, dtype=torch.bfloat16)
         
         # Diffusion action head
         self.action_head = DiffusionActionHead(
@@ -293,8 +308,11 @@ class SimpleVLA(nn.Module):
         # Process with PaliGemma processor
         # For simplicity, use the last image in history
         # In practice, you might want to process all images and aggregate
+        # Add <image> token to instructions as required by PaliGemma
+        instructions_with_image = [f"<image>\n{instr}" for instr in instructions]
+        
         inputs = self.processor(
-            text=instructions,
+            text=instructions_with_image,
             images=[combined_images[-1] for _ in range(batch_size)],
             return_tensors="pt",
             padding=True
@@ -302,8 +320,9 @@ class SimpleVLA(nn.Module):
         
         # Get features from PaliGemma
         # We'll use the encoder outputs
-        with torch.no_grad():
-            outputs = self.paligemma(**inputs, output_hidden_states=True)
+        # Note: We need gradients for training, so don't use no_grad()
+        # Use torch.cuda.amp for mixed precision if available
+        outputs = self.paligemma(**inputs, output_hidden_states=True)
         
         # Extract features from the last hidden state
         # PaliGemma returns hidden states from the language model
@@ -320,8 +339,13 @@ class SimpleVLA(nn.Module):
                 features = torch.zeros(
                     batch_size,
                     self.paligemma.config.text_config.hidden_size,
-                    device=device
+                    device=device,
+                    dtype=torch.bfloat16
                 )
+        
+        # Ensure features are in bfloat16
+        if features.dtype != torch.bfloat16:
+            features = features.to(torch.bfloat16)
         
         # Project features
         features = self.feature_proj(features)

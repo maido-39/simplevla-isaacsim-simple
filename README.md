@@ -135,6 +135,8 @@ python train.py \
 - `--lora_alpha`: LoRA alpha (default: 32)
 - `--val_split`: Validation split ratio (default: 0.2)
 - `--resume`: Path to checkpoint to resume from
+- `--save_interval`: Save checkpoint every N epochs (default: 1, saves every epoch)
+- `--log_dir`: Directory for TensorBoard logs (default: output_dir/runs)
 
 ## Data Format
 
@@ -191,6 +193,39 @@ The model supports three tasks:
 3. **Gate**: Pass through gate and reach target
 
 Each task has demonstrations from 4 different people with corresponding instructions.
+
+## Monitoring and Logging
+
+### TensorBoard
+
+Training metrics are automatically logged to TensorBoard. To view:
+
+```bash
+tensorboard --logdir ./checkpoints/runs
+```
+
+Then open your browser to `http://localhost:6006`
+
+TensorBoard logs include:
+- `Train/Loss`: Training loss per batch
+- `Train/LearningRate`: Learning rate per batch
+- `Val/Loss`: Validation loss per epoch
+
+### Training Logs
+
+All terminal output is automatically saved to a log file:
+- Location: `{output_dir}/training_{timestamp}.log`
+- Contains all print statements, errors, and training progress
+- Saved with timestamp for easy identification
+
+### Checkpoints
+
+Checkpoints are saved in the `output_dir` directory:
+- `latest.pth`: Latest checkpoint (updated every epoch)
+- `best.pth`: Best model based on validation loss
+- `checkpoint_epoch_{N}.pth`: Checkpoints saved at specified interval (default: every epoch)
+
+Use `--save_interval N` to save checkpoints every N epochs (useful for long training runs).
 
 ## Output
 
