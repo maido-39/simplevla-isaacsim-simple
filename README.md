@@ -227,6 +227,88 @@ Checkpoints are saved in the `output_dir` directory:
 
 Use `--save_interval N` to save checkpoints every N epochs (useful for long training runs).
 
+## Inference
+
+After training, you can use the model for inference to predict trajectories from images and instructions.
+
+### Basic Usage
+
+```bash
+python inference.py \
+    --checkpoint ./checkpoints/best.pth \
+    --ego_images path/to/ego1.jpg path/to/ego2.jpg path/to/ego3.jpg path/to/ego4.jpg path/to/ego5.jpg \
+    --top_images path/to/top1.jpg path/to/top2.jpg path/to/top3.jpg path/to/top4.jpg path/to/top5.jpg \
+    --instruction "Push the box to the target location" \
+    --output trajectory.npy \
+    --visualize
+```
+
+### Arguments
+
+- `--checkpoint`: Path to model checkpoint file (e.g., `best.pth`, `latest.pth`, or `checkpoint_epoch_N.pth`)
+- `--ego_images`: List of paths to ego camera images (must match history_length, default: 5)
+- `--top_images`: List of paths to top camera images (must match history_length, default: 5)
+- `--instruction`: Instruction text describing the task
+- `--output`: (Optional) Path to save predicted trajectory as numpy array (.npy)
+- `--visualize`: (Optional) Display trajectory visualization
+- `--viz_output`: (Optional) Path to save trajectory visualization image
+- `--device`: Device to use (`cuda` or `cpu`, default: `cuda`)
+
+### Example
+
+```bash
+# Predict trajectory and save results
+python inference.py \
+    --checkpoint ./checkpoints/best.pth \
+    --ego_images \
+        data/ego_frame0.jpg \
+        data/ego_frame1.jpg \
+        data/ego_frame2.jpg \
+        data/ego_frame3.jpg \
+        data/ego_frame4.jpg \
+    --top_images \
+        data/top_frame0.jpg \
+        data/top_frame1.jpg \
+        data/top_frame2.jpg \
+        data/top_frame3.jpg \
+        data/top_frame4.jpg \
+    --instruction "Move to the target location" \
+    --output predicted_trajectory.npy \
+    --visualize \
+    --viz_output trajectory_plot.png
+```
+
+### Output
+
+The inference script outputs:
+- **Console**: Predicted trajectory coordinates (x, y, z) for each time step
+- **Numpy file** (if `--output` specified): `[T, 3]` array of predicted positions
+- **Visualization** (if `--visualize` or `--viz_output` specified): Plot showing x, y, z positions over time
+
+### Using in Python Code
+
+```python
+from inference import load_model_from_checkpoint, load_images_from_paths, predict_trajectory
+import torch
+
+# Load model
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = load_model_from_checkpoint('./checkpoints/best.pth', device)
+
+# Load images
+ego_images, top_images = load_images_from_paths(
+    ['ego1.jpg', 'ego2.jpg', 'ego3.jpg', 'ego4.jpg', 'ego5.jpg'],
+    ['top1.jpg', 'top2.jpg', 'top3.jpg', 'top4.jpg', 'top5.jpg']
+)
+
+# Predict trajectory
+instruction = "Push the box to the target location"
+trajectory = predict_trajectory(model, ego_images, top_images, instruction, device)
+
+print(f"Predicted trajectory shape: {trajectory.shape}")
+print(f"First position: x={trajectory[0, 0]:.4f}, y={trajectory[0, 1]:.4f}, z={trajectory[0, 2]:.4f}")
+```
+
 ## Output
 
 The model outputs:
