@@ -1,0 +1,37 @@
+# Configuration file for Simple VLA Model
+
+# Data configuration
+data:
+  data_root: "/home/syaro/MikuchanRemote/Remotecontrol-Demo/Isaacsim-spot-remotecontroldemo/expr_data/20251121_Proto_Data"
+  history_length: 5
+  trajectory_length: 16
+  image_size: [224, 224]
+  task_type: null  # 'box', 'moving', 'gate', or null for all
+  val_split: 0.2
+
+# Model configuration
+model:
+  paligemma_model_name: "google/paligemma-3b-mix-224"
+  use_lora: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  action_dim: 3  # x, y, z position
+  hidden_dim: 256
+  num_timesteps: 1000  # Diffusion timesteps
+
+# Training configuration
+training:
+  batch_size: 4
+  epochs: 10
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  num_workers: 4
+  pin_memory: true
+
+# Output configuration
+output:
+  output_dir: "./checkpoints"
+  save_period: 5  # Save checkpoint every N epochs
+
