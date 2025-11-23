@@ -88,31 +88,49 @@ def validate(model, dataloader, device, epoch, writer=None):
     total_loss = 0.0
     num_batches = 0
     
+    # Clear cache before validation
+    torch.cuda.empty_cache()
+    
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Validating"):
-            ego_images = batch['ego_images'].to(device)
-            top_images = batch['top_images'].to(device)
-            robot_positions = batch['robot_positions'].to(device)
-            instructions = batch['instructions']
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Validating")):
+            # Clear cache periodically
+            if batch_idx % 10 == 0:
+                torch.cuda.empty_cache()
             
-            # Forward pass
-            noise_pred, noise, timesteps = model(
-                ego_images=ego_images,
-                top_images=top_images,
-                instructions=instructions,
-                robot_positions=robot_positions
-            )
-            
-            # Compute loss
-            loss = nn.functional.mse_loss(noise_pred, noise)
-            total_loss += loss.item()
-            num_batches += 1
+            try:
+                ego_images = batch['ego_images'].to(device)
+                top_images = batch['top_images'].to(device)
+                robot_positions = batch['robot_positions'].to(device)
+                instructions = batch['instructions']
+                
+                # Forward pass - model will compute loss when robot_positions are provided
+                noise_pred, noise, timesteps = model(
+                    ego_images=ego_images,
+                    top_images=top_images,
+                    instructions=instructions,
+                    robot_positions=robot_positions
+                )
+                
+                # Compute loss
+                loss = nn.functional.mse_loss(noise_pred, noise)
+                total_loss += loss.item()
+                num_batches += 1
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"\nOOM at validation batch {batch_idx}, clearing cache and skipping batch")
+                    torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     
     # Log to tensorboard
     if writer is not None:
         writer.add_scalar('Val/Loss', avg_loss, epoch)
+    
+    # Clear cache after validation
+    torch.cuda.empty_cache()
     
     return avg_loss
 
@@ -219,14 +237,20 @@ def main():
         pin_memory=True
     )
     
+    # Use smaller batch size for validation to avoid OOM
+    # Limit validation to first 50 samples to save memory
+    val_subset_size = min(50, len(val_dataset))
+    val_subset = torch.utils.data.Subset(val_dataset, list(range(val_subset_size)))
+    val_batch_size = 1  # Always use batch_size=1 for validation
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
+        val_subset,
+        batch_size=val_batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4,
-        pin_memory=True
+        num_workers=0,  # No workers to save memory
+        pin_memory=False  # Disable pin_memory to save memory
     )
+    logger.info(f"Validation subset size: {val_subset_size} (out of {len(val_dataset)} total validation samples)")
     
     # Create model
     logger.info("Creating model...")
@@ -237,7 +261,11 @@ def main():
         trajectory_length=args.trajectory_length,
         history_length=args.history_length
     )
-    model = model.to(device)
+    
+    # Note: PaliGemma uses device_map="auto" which handles device placement automatically
+    # The action_head and feature_proj are already on the correct device (created in __init__)
+    model_device = next(model.paligemma.parameters()).device
+    logger.info(f"Model device: {model_device}")
     
     # Resume from checkpoint if specified
     start_epoch = 0

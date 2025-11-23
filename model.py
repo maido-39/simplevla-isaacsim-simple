@@ -30,6 +30,7 @@ class DiffusionActionHead(nn.Module):
         
         # Create UNet for diffusion
         # Use hidden_dim for cross_attention_dim since we'll project features to hidden_dim
+        # Reduced size to save memory: smaller channels and fewer blocks
         self.unet = UNet2DConditionModel(
             sample_size=trajectory_length,
             in_channels=action_dim,
@@ -37,16 +38,14 @@ class DiffusionActionHead(nn.Module):
             down_block_types=(
                 "DownBlock2D",
                 "DownBlock2D",
-                "DownBlock2D",
             ),
             up_block_types=(
                 "UpBlock2D",
                 "UpBlock2D",
-                "UpBlock2D",
             ),
-            block_out_channels=(128, 256, 512),
+            block_out_channels=(64, 128),  # Reduced from (128, 256, 512)
             cross_attention_dim=hidden_dim,  # Match the projected dimension
-            attention_head_dim=8,
+            attention_head_dim=4,  # Reduced from 8
         )
         
         # Scheduler for diffusion
@@ -80,8 +79,15 @@ class DiffusionActionHead(nn.Module):
         # Convert features to float32 for UNet (UNet works better with float32)
         features = features.to(torch.float32)
         
+        # Get device for UNet (may be different from features device if action_head is on CPU)
+        unet_device = next(self.unet.parameters()).device
+        
         # Project features
         hidden = self.input_proj(features)  # [B, hidden_dim]
+        
+        # Move to UNet device if needed
+        if hidden.device != unet_device:
+            hidden = hidden.to(unet_device)
         
         # Expand for UNet conditioning
         # UNet expects encoder_hidden_states as [B, seq_len, hidden_dim]
@@ -89,10 +95,17 @@ class DiffusionActionHead(nn.Module):
         hidden = hidden.unsqueeze(1)  # [B, 1, hidden_dim]
         hidden = hidden.expand(-1, self.trajectory_length, -1)  # [B, T, hidden_dim]
         
-        if self.training and actions is not None:
-            # Training: apply diffusion process
+        if actions is not None:
+            # Training/Validation: apply diffusion process when ground truth is available
+            # Get UNet device
+            unet_device = next(self.unet.parameters()).device
+            
             # Reshape actions for UNet: [B, T, action_dim] -> [B, action_dim, T, 1]
             actions_reshaped = actions.permute(0, 2, 1).unsqueeze(-1)  # [B, action_dim, T, 1]
+            
+            # Move to UNet device if needed
+            if actions_reshaped.device != unet_device:
+                actions_reshaped = actions_reshaped.to(unet_device)
             
             # Sample noise
             noise = torch.randn_like(actions_reshaped)
@@ -101,8 +114,11 @@ class DiffusionActionHead(nn.Module):
             if timesteps is None:
                 timesteps = torch.randint(
                     0, self.scheduler.num_train_timesteps,
-                    (batch_size,), device=features.device
+                    (batch_size,), device=unet_device
                 )
+            
+            # Ensure timesteps are on correct device
+            timesteps = timesteps.to(unet_device)
             
             # Add noise to actions
             noisy_actions = self.scheduler.add_noise(actions_reshaped, noise, timesteps)
@@ -117,14 +133,20 @@ class DiffusionActionHead(nn.Module):
             return noise_pred, noise, timesteps
         else:
             # Inference: denoising process
+            # Get UNet device
+            unet_device = next(self.unet.parameters()).device
+            
             # Start with random noise
             actions_shape = (batch_size, self.action_dim, self.trajectory_length, 1)
-            actions = torch.randn(actions_shape, device=features.device)
+            actions = torch.randn(actions_shape, device=unet_device, dtype=torch.float32)
             
             # Denoise step by step
             self.scheduler.set_timesteps(self.num_timesteps)
             
-            for t in self.scheduler.timesteps:
+            # Move scheduler timesteps to correct device
+            timesteps = self.scheduler.timesteps.to(unet_device)
+            
+            for t in timesteps:
                 # Predict noise
                 noise_pred = self.unet(
                     actions,
@@ -137,6 +159,10 @@ class DiffusionActionHead(nn.Module):
             
             # Reshape back: [B, action_dim, T, 1] -> [B, T, action_dim]
             actions = actions.squeeze(-1).permute(0, 2, 1)
+            
+            # Move back to features device if needed
+            if actions.device != features.device:
+                actions = actions.to(features.device)
             
             return actions
 
@@ -198,6 +224,7 @@ class SimpleVLA(nn.Module):
         
         # Load processor and model with token if available
         # Hugging Face will automatically use cached files if they exist
+        # Note: device_map="auto" handles device placement automatically, so we don't need to call .to(device) later
         if token:
             print("Using Hugging Face token for authentication")
             self.processor = PaliGemmaProcessor.from_pretrained(
@@ -224,6 +251,11 @@ class SimpleVLA(nn.Module):
                 device_map="auto",
                 cache_dir=cache_dir
             )
+        
+        # Store device info - device_map="auto" may place model on multiple devices
+        # Get the primary device (usually the first CUDA device)
+        self.device = next(self.paligemma.parameters()).device
+        print(f"PaliGemma model placed on device: {self.device}")
         
         # Apply LoRA if requested
         if use_lora:
@@ -252,16 +284,34 @@ class SimpleVLA(nn.Module):
         # We'll extract features from the language model's hidden states
         hidden_size = self.paligemma.config.text_config.hidden_size
         
+        # Get device from PaliGemma (may be on CUDA if device_map="auto" placed it there)
+        model_device = next(self.paligemma.parameters()).device
+        
         # Feature projection to combine vision and language
         # Use bfloat16 to match PaliGemma model dtype
+        # Create on CPU first, then move to device (to avoid OOM during initialization)
         self.feature_proj = nn.Linear(hidden_size, hidden_size, dtype=torch.bfloat16)
         
         # Diffusion action head
+        # Create on CPU first, then move to device (to avoid OOM during initialization)
         self.action_head = DiffusionActionHead(
             input_dim=hidden_size,
             action_dim=action_dim,
             trajectory_length=trajectory_length
         )
+        
+        # Move to device after creation (this is more memory efficient)
+        try:
+            self.feature_proj = self.feature_proj.to(model_device)
+            self.action_head = self.action_head.to(model_device)
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"Warning: Could not move action_head to {model_device} due to OOM.")
+                print("Action head will remain on CPU (slower but will work)")
+                # Keep on CPU if OOM
+                pass
+            else:
+                raise
     
     def encode_images_and_text(
         self,
@@ -281,7 +331,8 @@ class SimpleVLA(nn.Module):
             features: [B, hidden_size] - combined features
         """
         batch_size = ego_images.shape[0]
-        device = ego_images.device
+        # Use the device from PaliGemma model
+        device = self.device if hasattr(self, 'device') else ego_images.device
         
         # Process images and text with processor
         # Combine ego and top images
@@ -377,12 +428,14 @@ class SimpleVLA(nn.Module):
         features = self.encode_images_and_text(ego_images, top_images, instructions)
         
         # Generate trajectory using diffusion head
-        if self.training and robot_positions is not None:
+        # If robot_positions are provided, compute training loss (for both train and eval)
+        if robot_positions is not None:
             noise_pred, noise, timesteps = self.action_head(
                 features, robot_positions, timesteps
             )
             return noise_pred, noise, timesteps
         else:
+            # Pure inference - no ground truth
             predicted_positions = self.action_head(features)
             return predicted_positions
 
