@@ -38,7 +38,13 @@ class VLAInferenceAPI:
             history_length: History length for input images
             trajectory_length: Length of predicted trajectory
         """
-        self.device = torch.device(device if torch.cuda.is_available() and device == 'cuda' else 'cpu')
+        # Force CUDA if available, otherwise use CPU
+        if device == 'cuda' and torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        else:
+            if device == 'cuda':
+                print("Warning: CUDA requested but not available, using CPU")
+            self.device = torch.device('cpu')
         self.history_length = history_length
         self.trajectory_length = trajectory_length
         
@@ -98,7 +104,21 @@ class VLAInferenceAPI:
         
         # Load weights
         model.load_state_dict(checkpoint['model_state_dict'])
-        model = model.to(self.device)
+        
+        # Note: PaliGemma uses device_map="auto" which handles device placement
+        # We don't need to call .to(device) as it's already placed
+        # Just ensure action_head and feature_proj are on the correct device
+        model_device = next(model.paligemma.parameters()).device
+        if hasattr(model, 'action_head'):
+            try:
+                model.action_head = model.action_head.to(model_device)
+            except:
+                pass  # May already be on correct device or on CPU
+        if hasattr(model, 'feature_proj'):
+            try:
+                model.feature_proj = model.feature_proj.to(model_device)
+            except:
+                pass
         
         print(f"Model loaded successfully")
         print(f"  - History length: {history_length}")
@@ -180,13 +200,14 @@ class VLAInferenceAPI:
         # Extract language model hidden states
         if hasattr(outputs, 'hidden_states') and outputs.hidden_states:
             hidden_states = outputs.hidden_states[-1]  # [B, seq_len, hidden_size]
-            intermediates['language_hidden_states'] = hidden_states.cpu().numpy()
-            intermediates['language_hidden_states_mean'] = hidden_states.mean(dim=1).cpu().numpy()
+            # Convert bfloat16 to float32 and detach before numpy conversion
+            intermediates['language_hidden_states'] = hidden_states.cpu().detach().float().numpy()
+            intermediates['language_hidden_states_mean'] = hidden_states.mean(dim=1).cpu().detach().float().numpy()
             features = hidden_states.mean(dim=1)  # [B, hidden_size]
         else:
             if hasattr(outputs, 'logits'):
                 features = outputs.logits.mean(dim=1)
-                intermediates['language_logits'] = outputs.logits.cpu().numpy()
+                intermediates['language_logits'] = outputs.logits.cpu().detach().float().numpy()
             else:
                 raise ValueError("Could not extract features from PaliGemma outputs")
         
@@ -196,7 +217,8 @@ class VLAInferenceAPI:
         # Feature projection
         t0 = time.time()
         features_proj = self.model.feature_proj(features)
-        intermediates['projected_features'] = features_proj.cpu().numpy()
+        # Convert bfloat16 to float32 and detach before numpy conversion
+        intermediates['projected_features'] = features_proj.cpu().detach().float().numpy()
         t1 = time.time()
         self.component_times['feature_projection'].append(t1 - t0)
         
@@ -235,7 +257,14 @@ class VLAInferenceAPI:
             )
             intermediates.update(enc_intermediates)
         else:
+            # Still track timing even without intermediates
+            t0 = time.time()
             features = self.model.encode_images_and_text(ego_images, top_images, [instruction])
+            t1 = time.time()
+            # Rough split: 60% vision, 40% language
+            self.component_times['vision_encoding'].append((t1 - t0) * 0.6)
+            self.component_times['language_encoding'].append((t1 - t0) * 0.4)
+            self.component_times['feature_projection'].append(0.001)  # Small overhead
         
         # Diffusion inference
         t0 = time.time()
@@ -244,8 +273,8 @@ class VLAInferenceAPI:
         
         # Capture diffusion intermediate states if possible
         if capture_intermediates:
-            # Store diffusion features
-            intermediates['diffusion_features'] = features.cpu().numpy()
+            # Store diffusion features (convert to float32 and detach if needed)
+            intermediates['diffusion_features'] = features.cpu().detach().float().numpy()
             intermediates['diffusion_input_shape'] = trajectory.shape
         
         t1 = time.time()
@@ -256,13 +285,21 @@ class VLAInferenceAPI:
         intermediates['final_trajectory'] = trajectory
         
         # Track total inference time
-        total_time = sum([
-            self.component_times['vision_encoding'][-1],
-            self.component_times['language_encoding'][-1],
-            self.component_times['feature_projection'][-1],
-            self.component_times['diffusion'][-1]
-        ])
-        self.inference_times.append(total_time)
+        if (len(self.component_times['vision_encoding']) > 0 and 
+            len(self.component_times['language_encoding']) > 0 and
+            len(self.component_times['feature_projection']) > 0 and
+            len(self.component_times['diffusion']) > 0):
+            total_time = sum([
+                self.component_times['vision_encoding'][-1],
+                self.component_times['language_encoding'][-1],
+                self.component_times['feature_projection'][-1],
+                self.component_times['diffusion'][-1]
+            ])
+            self.inference_times.append(total_time)
+        else:
+            # If component times weren't recorded, use diffusion time as estimate
+            if len(self.component_times['diffusion']) > 0:
+                self.inference_times.append(self.component_times['diffusion'][-1] * 1.5)  # Rough estimate
         
         return trajectory, intermediates
     

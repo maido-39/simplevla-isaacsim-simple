@@ -141,21 +141,25 @@ class DiffusionActionHead(nn.Module):
             actions = torch.randn(actions_shape, device=unet_device, dtype=torch.float32)
             
             # Denoise step by step
-            self.scheduler.set_timesteps(self.num_timesteps)
+            # Set timesteps and ensure they're on the correct device
+            self.scheduler.set_timesteps(self.num_timesteps, device=unet_device)
             
-            # Move scheduler timesteps to correct device
-            timesteps = self.scheduler.timesteps.to(unet_device)
+            # Get timesteps (should already be on device from set_timesteps)
+            timesteps = self.scheduler.timesteps
             
             for t in timesteps:
+                # Ensure t is on the correct device
+                t = t.to(unet_device)
                 # Predict noise
                 noise_pred = self.unet(
                     actions,
-                    t.unsqueeze(0).expand(batch_size),
+                    t.unsqueeze(0).expand(batch_size).to(unet_device),
                     encoder_hidden_states=hidden
                 ).sample
                 
-                # Denoise
-                actions = self.scheduler.step(noise_pred, t, actions).prev_sample
+                # Denoise - ensure all inputs are on same device
+                step_output = self.scheduler.step(noise_pred, t.to(unet_device), actions)
+                actions = step_output.prev_sample
             
             # Reshape back: [B, action_dim, T, 1] -> [B, T, action_dim]
             actions = actions.squeeze(-1).permute(0, 2, 1)
