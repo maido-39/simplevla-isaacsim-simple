@@ -2,8 +2,45 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PaliGemmaProcessor, PaliGemmaForConditionalGeneration
-from peft import LoraConfig, get_peft_model, TaskType
-from diffusers import UNet2DConditionModel, DDPMScheduler
+
+# Try to import peft - required for LoRA support
+try:
+    from peft import LoraConfig, get_peft_model, TaskType
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
+    print("Warning: peft module not available. LoRA functionality will be disabled.")
+    print("To install: pip install peft")
+
+# Try to import diffusers - handle version compatibility issues
+# Note: robomimic requires diffusers==0.11.1 and huggingface_hub==0.23.4
+# We need to work with these versions if robomimic is installed
+try:
+    from diffusers import UNet2DConditionModel, DDPMScheduler, DDIMScheduler
+    DIFFUSERS_AVAILABLE = True
+except ImportError as e:
+    DIFFUSERS_AVAILABLE = False
+    error_msg = str(e)
+    print(f"Warning: diffusers module not available or has compatibility issues: {e}")
+    
+    # Check if it's the cached_download issue
+    if "cached_download" in error_msg or "cannot import name" in error_msg:
+        print("\nThis is likely a version mismatch between diffusers and huggingface_hub.")
+        print("If you have robomimic installed, it requires specific versions:")
+        print("  - diffusers==0.11.1")
+        print("  - huggingface_hub==0.23.4")
+        print("\nTry installing these exact versions:")
+        print("  pip install diffusers==0.11.1 huggingface_hub==0.23.4")
+        print("\nNote: This may show dependency warnings, but should work.")
+        print("See FIX_ROBOMIMIC_CONFLICT.md for more options.")
+    else:
+        print("Try: pip install diffusers huggingface_hub")
+    
+    # Create dummy classes for type hints
+    UNet2DConditionModel = None
+    DDPMScheduler = None
+    DDIMScheduler = None
+
 from typing import Optional, Tuple
 import math
 import os
@@ -21,16 +58,33 @@ class DiffusionActionHead(nn.Module):
         action_dim: int = 3,  # x, y, z position
         hidden_dim: int = 256,
         num_timesteps: int = 1000,
-        trajectory_length: int = 16
+        trajectory_length: int = 16,
+        num_inference_steps: int = 50,  # Number of inference steps (can be much less than num_timesteps)
+        use_ddim: bool = True,  # Use DDIM for faster inference
+        unet_channels: tuple = (32, 64)  # Further reduced UNet channels
     ):
         super().__init__()
+        
+        # Check if diffusers is available
+        if not DIFFUSERS_AVAILABLE:
+            raise ImportError(
+                "diffusers module is required for DiffusionActionHead but is not available.\n"
+                "This is likely due to a version mismatch between diffusers and huggingface_hub.\n"
+                "Please install compatible versions:\n"
+                "  pip install 'diffusers>=0.21.0' 'huggingface_hub>=0.16.0,<0.20.0'\n"
+                "Or try:\n"
+                "  pip install --upgrade diffusers huggingface_hub"
+            )
+        
         self.action_dim = action_dim
         self.trajectory_length = trajectory_length
         self.num_timesteps = num_timesteps
+        self.num_inference_steps = num_inference_steps
+        self.use_ddim = use_ddim
         
         # Create UNet for diffusion
         # Use hidden_dim for cross_attention_dim since we'll project features to hidden_dim
-        # Reduced size to save memory: smaller channels and fewer blocks
+        # Further reduced size: smaller channels and fewer blocks
         self.unet = UNet2DConditionModel(
             sample_size=trajectory_length,
             in_channels=action_dim,
@@ -43,17 +97,25 @@ class DiffusionActionHead(nn.Module):
                 "UpBlock2D",
                 "UpBlock2D",
             ),
-            block_out_channels=(64, 128),  # Reduced from (128, 256, 512)
+            block_out_channels=unet_channels,  # Further reduced: (32, 64) instead of (64, 128)
             cross_attention_dim=hidden_dim,  # Match the projected dimension
-            attention_head_dim=4,  # Reduced from 8
+            attention_head_dim=2,  # Further reduced from 4
         )
         
         # Scheduler for diffusion
-        self.scheduler = DDPMScheduler(
-            num_train_timesteps=num_timesteps,
-            beta_schedule="linear",
-            prediction_type="epsilon"
-        )
+        # Use DDIM for faster inference with fewer steps
+        if use_ddim:
+            self.scheduler = DDIMScheduler(
+                num_train_timesteps=num_timesteps,
+                beta_schedule="linear",
+                prediction_type="epsilon"
+            )
+        else:
+            self.scheduler = DDPMScheduler(
+                num_train_timesteps=num_timesteps,
+                beta_schedule="linear",
+                prediction_type="epsilon"
+            )
         
         # Projection layer to match UNet input
         # Use float32 for UNet (diffusers UNet works better with float32)
@@ -141,8 +203,9 @@ class DiffusionActionHead(nn.Module):
             actions = torch.randn(actions_shape, device=unet_device, dtype=torch.float32)
             
             # Denoise step by step
-            # Set timesteps and ensure they're on the correct device
-            self.scheduler.set_timesteps(self.num_timesteps, device=unet_device)
+            # Use fewer inference steps for faster generation
+            # Set timesteps with num_inference_steps (much less than num_timesteps)
+            self.scheduler.set_timesteps(self.num_inference_steps, device=unet_device)
             
             # Get timesteps (should already be on device from set_timesteps)
             timesteps = self.scheduler.timesteps
@@ -263,6 +326,12 @@ class SimpleVLA(nn.Module):
         
         # Apply LoRA if requested
         if use_lora:
+            if not PEFT_AVAILABLE:
+                raise ImportError(
+                    "LoRA requested but 'peft' module is not available. "
+                    "Please install it with: pip install peft\n"
+                    "Or set use_lora=False if you don't need LoRA support."
+                )
             print("Applying LoRA to PaliGemma...")
             # PaliGemma is based on Gemma (causal LM), so use CAUSAL_LM task type
             lora_config = LoraConfig(
@@ -298,10 +367,15 @@ class SimpleVLA(nn.Module):
         
         # Diffusion action head
         # Create on CPU first, then move to device (to avoid OOM during initialization)
+        # Use optimized settings: fewer timesteps, fewer inference steps, smaller UNet
         self.action_head = DiffusionActionHead(
             input_dim=hidden_size,
             action_dim=action_dim,
-            trajectory_length=trajectory_length
+            trajectory_length=trajectory_length,
+            num_timesteps=500,  # Reduced from 1000 for faster training
+            num_inference_steps=20,  # Only 20 steps for inference (much faster!)
+            use_ddim=True,  # Use DDIM for faster inference
+            unet_channels=(32, 64)  # Smaller UNet: (32, 64) instead of (64, 128)
         )
         
         # Move to device after creation (this is more memory efficient)

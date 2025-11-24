@@ -18,7 +18,10 @@ model:
   lora_dropout: 0.1
   action_dim: 3  # x, y, z position
   hidden_dim: 256
-  num_timesteps: 1000  # Diffusion timesteps
+  num_timesteps: 500  # Diffusion training timesteps (reduced from 1000)
+  num_inference_steps: 20  # Inference steps (much fewer for speed)
+  use_ddim: true  # Use DDIM scheduler for faster inference
+  unet_channels: [32, 64]  # Smaller UNet channels (reduced from [64, 128])
 
 # Training configuration
 training:

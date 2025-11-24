@@ -90,6 +90,19 @@ class VLAInferenceAPI:
             lora_r = config.get('lora_r', 16)
             lora_alpha = config.get('lora_alpha', 32)
         
+        # Check if LoRA is required but peft is not available
+        if use_lora:
+            try:
+                import peft
+            except ImportError:
+                raise ImportError(
+                    f"Model checkpoint requires LoRA but 'peft' module is not available.\n"
+                    f"Please install it in Isaac Sim's Python environment:\n"
+                    f"  - Find Isaac Sim's Python: which python (in Isaac Sim terminal)\n"
+                    f"  - Install: pip install peft\n"
+                    f"Or use a checkpoint trained without LoRA (use_lora=False)."
+                )
+        
         self.history_length = history_length
         self.trajectory_length = trajectory_length
         
